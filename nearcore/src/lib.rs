@@ -5,16 +5,27 @@ use actix::{Actor, Addr};
 use actix_rt::ArbiterHandle;
 use actix_web;
 use anyhow::Context;
+use near_chain::types::Tip;
 use near_chain::{Chain, ChainGenesis};
 use near_client::{start_client, start_view_client, ClientActor, ConfigUpdater, ViewClientActor};
+use near_epoch_manager::EpochManagerAdapter;
+
 use near_network::time;
 use near_network::types::NetworkRecipient;
 use near_network::PeerManagerActor;
 use near_primitives::block::GenesisId;
-use near_store::{DBCol, Mode, NodeStorage, StoreOpenerError, Temperature};
+use near_primitives::hash::CryptoHash;
+use near_primitives::types::BlockHeight;
+use near_store::cold_storage::{update_cold_db, update_cold_head};
+use near_store::db::ColdDB;
+use near_store::{
+    DBCol, Mode, NodeStorage, Store, StoreOpenerError, Temperature, FINAL_HEAD_KEY, HEAD_KEY,
+};
 use near_telemetry::TelemetryActor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::thread;
 use tokio::sync::broadcast;
 use tracing::{info, trace};
 
@@ -143,15 +154,179 @@ fn open_storage(home_dir: &Path, near_config: &mut NearConfig) -> anyhow::Result
     Ok(storage)
 }
 
+pub struct ColdStoreLoopHandle {
+    join_handle: thread::JoinHandle<()>,
+    keep_going: Arc<AtomicBool>,
+}
+
+impl ColdStoreLoopHandle {
+    pub fn stop(self) {
+        self.keep_going.store(false, std::sync::atomic::Ordering::SeqCst);
+        match self.join_handle.join() {
+            Ok(_) => {
+                tracing::debug!(target:"cold_store", "Joined the cold store loop thread");
+            }
+            Err(_) => {
+                tracing::error!(target:"cold_store", "Failed to join the cold store loop thread");
+            }
+        }
+    }
+}
+
 pub struct NearNode {
     pub client: Addr<ClientActor>,
     pub view_client: Addr<ViewClientActor>,
     pub arbiters: Vec<ArbiterHandle>,
     pub rpc_servers: Vec<(&'static str, actix_web::dev::ServerHandle)>,
+    pub cold_store_loop_handle: Option<ColdStoreLoopHandle>,
 }
 
 pub fn start_with_config(home_dir: &Path, config: NearConfig) -> anyhow::Result<NearNode> {
     start_with_config_and_synchronization(home_dir, config, None, None)
+}
+
+/// The status of the cold store loop indicates if the loop should before
+/// the next copy attempt or if it should actively continue copying.
+enum ColdStoreLoopStatus {
+    Sleep,
+    Continue,
+}
+
+fn cold_store_copy(
+    hot_store: &Store,
+    cold_store: &Store,
+    cold_db: &Arc<ColdDB>,
+    genesis_height: BlockHeight,
+    runtime: &Arc<NightshadeRuntime>,
+) -> anyhow::Result<ColdStoreLoopStatus> {
+    let cold_head = cold_store.get_ser::<Tip>(DBCol::BlockMisc, HEAD_KEY)?;
+    let cold_head_height = match cold_head {
+        Some(cold_head) => cold_head.height,
+        None => genesis_height,
+    };
+
+    // If FINAL_HEAD is not set for hot storage though, we default it to 0.
+    let hot_final_head = hot_store.get_ser::<Tip>(DBCol::BlockMisc, FINAL_HEAD_KEY)?;
+    let hot_final_head_height = match hot_final_head {
+        Some(hot_final_head) => hot_final_head.height,
+        None => genesis_height,
+    };
+
+    tracing::debug!(target: "cold_store", "cold_head {} hot_final_head {}", cold_head_height, hot_final_head_height);
+
+    if cold_head_height > hot_final_head_height {
+        tracing::error!(target: "cold_store", "Error, cold head is ahead of final head, this should never take place!");
+    }
+
+    if cold_head_height >= hot_final_head_height {
+        return Ok(ColdStoreLoopStatus::Sleep);
+    }
+
+    let next_height = cold_head_height + 1;
+
+    // Here it should be sufficient to just read from hot storage.
+    // Because BlockHeight is never garbage collectable and is not even copied to cold.
+    let cold_head_hash =
+        hot_store.get_ser::<CryptoHash>(DBCol::BlockHeight, &cold_head_height.to_le_bytes())?;
+    let cold_head_hash = match cold_head_hash {
+        Some(cold_head_hash) => cold_head_hash,
+        None => return Err(anyhow::anyhow!("Failed to read the cold head hash")),
+    };
+
+    // The previous block is the cold head so we can use it to get epoch id.
+    let epoch_id = &runtime.get_epoch_id_from_prev_block(&cold_head_hash)?;
+    let shard_layout = runtime.get_shard_layout(epoch_id)?;
+
+    update_cold_db(cold_db, hot_store, &shard_layout, &next_height)?;
+
+    update_cold_head(cold_db, hot_store, &next_height)?;
+
+    // Continue without sleeping until cold head == final head.
+    Ok(ColdStoreLoopStatus::Continue)
+}
+
+// This method will copy data from hot storage to cold storage in a loop.
+// It will try to copy blocks as fast as possible at until cold head = final head.
+// Once the cold head reaches the final head it will sleep for one second between
+// copying data.
+// TODO clean up the interface, currently we need to pass hot and cold store and
+// cold_db that contains both stores anyway.
+fn cold_store_loop(
+    keep_going: Arc<AtomicBool>,
+    hot_store: Store,
+    cold_store: Store,
+    cold_db: Arc<ColdDB>,
+    genesis_height: BlockHeight,
+    runtime: Arc<NightshadeRuntime>,
+) {
+    tracing::info!(target: "cold_store", "starting cold store loop");
+
+    // TODO - is there a better way to schedule a function to run periodically?
+    // NOTE - sleeping here, if spawned in rayon, would likely hog the thread forever
+    // which is why this method is spawned in rust native thread. The hope is that
+    // the OS will correctly handle this thread sleeping and return the CPU time to
+    // other threads.
+    loop {
+        if !keep_going.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::debug!(target: "cold_store", "stopping the cold store loop");
+            break;
+        }
+        let status = cold_store_copy(&hot_store, &cold_store, &cold_db, genesis_height, &runtime);
+
+        match status {
+            Err(err) => {
+                tracing::error!(target:"cold_store", "cold_store_copy failed with error : {err}");
+                thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Ok(ColdStoreLoopStatus::Sleep) => {
+                thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Ok(ColdStoreLoopStatus::Continue) => {
+                continue;
+            }
+        }
+    }
+}
+
+fn spawn_cold_store_loop(
+    config: &NearConfig,
+    storage: &NodeStorage,
+    runtime: Arc<NightshadeRuntime>,
+) -> anyhow::Result<Option<ColdStoreLoopHandle>> {
+    tracing::info!("tracing info spawn cold store loop");
+    let hot_store = storage.get_hot_store();
+    let cold_store = match storage.get_cold_store() {
+        Some(cold_store) => cold_store,
+        None => {
+            tracing::debug!(target:"cold_store", "Not spawning cold store loop because cold store is not configured");
+            return Ok(None);
+        }
+    };
+    let cold_db = match storage.cold_db() {
+        Some(cold_db) => cold_db.clone(),
+        None => {
+            tracing::debug!(target:"cold_store", "Not spawning cold store loop because cold store is not configured");
+            return Ok(None);
+        }
+    };
+
+    let genesis_height = config.genesis.config.genesis_height;
+    let keep_going = Arc::new(AtomicBool::new(true));
+    let keep_going_clone = keep_going.clone();
+
+    let join_handle =
+        thread::Builder::new().name("cold_store_loop".to_string()).spawn(move || {
+            cold_store_loop(
+                keep_going_clone,
+                hot_store,
+                cold_store,
+                cold_db,
+                genesis_height,
+                runtime,
+            )
+        })?;
+
+    Ok(Some(ColdStoreLoopHandle { join_handle, keep_going }))
 }
 
 pub fn start_with_config_and_synchronization(
@@ -169,6 +344,8 @@ pub fn start_with_config_and_synchronization(
         store.get_store(Temperature::Hot),
         &config,
     ));
+
+    let cold_store_loop_handle = spawn_cold_store_loop(&config, &store, runtime.clone())?;
 
     let telemetry = TelemetryActor::new(config.telemetry_config.clone()).start();
     let chain_genesis = ChainGenesis::new(&config.genesis);
@@ -249,6 +426,7 @@ pub fn start_with_config_and_synchronization(
         view_client,
         rpc_servers,
         arbiters: vec![client_arbiter_handle],
+        cold_store_loop_handle,
     })
 }
 
