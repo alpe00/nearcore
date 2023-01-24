@@ -258,6 +258,14 @@ impl JsonRpcClient {
     ) -> RpcRequest<near_jsonrpc_primitives::types::config::RpcProtocolConfigResponse> {
         call_method(&self.client, &self.server_addr, "EXPERIMENTAL_protocol_config", request)
     }
+
+    #[allow(non_snake_case)]
+    pub fn EXPERIMENTAL_split_storage(
+        &self,
+        request: near_jsonrpc_primitives::types::split_storage::RpcSplitStorageRequest,
+    ) -> RpcRequest<near_jsonrpc_primitives::types::split_storage::RpcSplitStorageResponse> {
+        call_method(&self.client, &self.server_addr, "EXPERIMENTAL_split_storage", request)
+    }
 }
 
 fn create_client() -> Client {

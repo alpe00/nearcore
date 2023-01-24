@@ -1,26 +1,27 @@
+use near_client_primitives::types::GetSplitStorageResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// #[derive(Serialize, Deserialize, Debug)]
-// pub struct RpcClientConfigRequest {}
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RpcSplitStorageRequest {}
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct RpcClientConfigResponse {
+pub struct RpcSplitStorageResponse {
     #[serde(flatten)]
-    pub client_config: near_chain_configs::ClientConfig,
+    pub result: GetSplitStorageResult,
 }
 
 #[derive(thiserror::Error, Debug, Serialize, Deserialize)]
 #[serde(tag = "name", content = "info", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RpcClientConfigError {
+pub enum RpcSplitStorageError {
     #[error("The node reached its limits. Try again later. More details: {error_message}")]
     InternalError { error_message: String },
 }
 
-impl From<RpcClientConfigError> for crate::errors::RpcError {
-    fn from(error: RpcClientConfigError) -> Self {
+impl From<RpcSplitStorageError> for crate::errors::RpcError {
+    fn from(error: RpcSplitStorageError) -> Self {
         let error_data = match &error {
-            RpcClientConfigError::InternalError { .. } => Some(Value::String(error.to_string())),
+            RpcSplitStorageError::InternalError { .. } => Some(Value::String(error.to_string())),
         };
 
         let error_data_value = match serde_json::to_value(error) {
@@ -28,7 +29,7 @@ impl From<RpcClientConfigError> for crate::errors::RpcError {
             Err(err) => {
                 return Self::new_internal_error(
                     None,
-                    format!("Failed to serialize RpcClientConfigError: {:?}", err),
+                    format!("Failed to serialize RpcSplitStorageError: {:?}", err),
                 )
             }
         };

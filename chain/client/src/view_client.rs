@@ -2,8 +2,10 @@
 //! Useful for querying from RPC.
 
 use actix::{Actor, Addr, Handler, SyncArbiter, SyncContext};
+use near_chain::types::Tip;
 use near_primitives::receipt::Receipt;
 use near_primitives::time::Clock;
+use near_store::{DBCol, COLD_HEAD_KEY, FINAL_HEAD_KEY, HEAD_KEY};
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -22,9 +24,10 @@ use near_client_primitives::types::{
     GetBlockWithMerkleTree, GetChunkError, GetExecutionOutcome, GetExecutionOutcomeError,
     GetExecutionOutcomesForBlock, GetGasPrice, GetGasPriceError, GetMaintenanceWindows,
     GetMaintenanceWindowsError, GetNextLightClientBlockError, GetProtocolConfig,
-    GetProtocolConfigError, GetReceipt, GetReceiptError, GetStateChangesError,
-    GetStateChangesWithCauseInBlock, GetStateChangesWithCauseInBlockForTrackedShards,
-    GetValidatorInfoError, Query, QueryError, TxStatus, TxStatusError,
+    GetProtocolConfigError, GetReceipt, GetReceiptError, GetSplitStorage, GetSplitStorageError,
+    GetSplitStorageResult, GetStateChangesError, GetStateChangesWithCauseInBlock,
+    GetStateChangesWithCauseInBlockForTrackedShards, GetValidatorInfoError, Query, QueryError,
+    TxStatus, TxStatusError,
 };
 #[cfg(feature = "test_features")]
 use near_network::types::NetworkAdversarialMessage;
@@ -1419,6 +1422,30 @@ impl Handler<WithSpanContext<GetMaintenanceWindows>> for ViewClientActor {
     ) -> Self::Result {
         let (_span, msg) = handler_debug_span!(target: "client", msg);
         Ok(self.get_maintenance_windows(msg.account_id)?)
+    }
+}
+
+impl Handler<WithSpanContext<GetSplitStorage>> for ViewClientActor {
+    type Result = Result<GetSplitStorageResult, GetSplitStorageError>;
+
+    fn handle(
+        &mut self,
+        msg: WithSpanContext<GetSplitStorage>,
+        _: &mut Self::Context,
+    ) -> Self::Result {
+        let (_span, _msg) = handler_debug_span!(target: "client", msg);
+        let _d = delay_detector::DelayDetector::new(|| "client get split storage".into());
+
+        let store = self.chain.store().store();
+        let head = store.get_ser::<Tip>(DBCol::BlockMisc, HEAD_KEY)?;
+        let final_head = store.get_ser::<Tip>(DBCol::BlockMisc, FINAL_HEAD_KEY)?;
+        let cold_head = store.get_ser::<Tip>(DBCol::BlockMisc, COLD_HEAD_KEY)?;
+
+        Ok(GetSplitStorageResult {
+            head_height: head.map(|tip| tip.height),
+            final_head_height: final_head.map(|tip| tip.height),
+            cold_head_height: cold_head.map(|tip| tip.height),
+        })
     }
 }
 
